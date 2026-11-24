@@ -937,3 +937,208 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// MTBUF `tbuffer_load_format_xyzw v[vdata:vdata+3], off, s[srsrc:srsrc+3], 0
+/// format:format`.
+const fn tbuffer_load_format_xyzw(vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (format as u32 & 0x7F) << 19 | 0x3 << 16,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// Stores the 4 input dwords to dwords 0..3 of the UAV, loads them back
+/// with `tbuffer_load_format_xyzw` in each of `formats` and stores format
+/// `j`'s 4 channels at dwords `4 * (j + 1)..`, on every available host:
+/// `check(backend, row, inputs, j, channels)`.
+fn run_typed_loads(
+    formats: &[u8],
+    rows: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], usize, [u32; 4]),
+) {
+    let mut body = Vec::new();
+    for k in 0..4u8 {
+        body.extend_from_slice(&buffer_store_dword(1 + k, 8, 4 * u16::from(k)));
+    }
+    for (j, &format) in formats.iter().enumerate() {
+        body.extend_from_slice(&tbuffer_load_format_xyzw(4, 8, format));
+        for k in 0..4u8 {
+            let at = 16 * (j as u16 + 1) + 4 * u16::from(k);
+            body.extend_from_slice(&buffer_store_dword(4 + k, 8, at));
+        }
+    }
+    // The harness stores v0 to dword 0 last: keep the input there.
+    body.push(vop1(0x001, 0, vgpr(1)));
+    let shader = build_valu_cs(&body);
+    let dwords = 4 * (formats.len() as u32 + 1);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (i, &inputs) in rows.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(dwords)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0][..4], inputs[..], "{label}: the stored inputs");
+            for j in 0..formats.len() {
+                let at = 4 * (j + 1);
+                let got = [out[0][at], out[0][at + 1], out[0][at + 2], out[0][at + 3]];
+                check(label, i, inputs, j, got);
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn tbuffer_load_channels_past_the_format_read_zero() {
+    // RDNA2 (gfx1036): 0 in every channel the format doesn't have, the 4th
+    // too (not 1), for every numeric kind. `(format, channels)`: 8_UINT,
+    // 32_FLOAT, 16_16_SNORM, 16_16_FLOAT, 10_11_11_UNORM, 11_11_10_FLOAT,
+    // 32_32_32_UINT, 32_32_32_FLOAT.
+    let formats: &[(u8, usize)] = &[
+        (5, 1),
+        (22, 1),
+        (24, 2),
+        (29, 2),
+        (30, 3),
+        (43, 3),
+        (72, 3),
+        (74, 3),
+    ];
+    let list: Vec<u8> = formats.iter().map(|f| f.0).collect();
+    let rows = [
+        [0x3F80_0001, 0x4000_0001, 0x4040_0001, 0x4080_0001],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF],
+    ];
+    run_typed_loads(&list, &rows, |backend, _, inputs, j, got| {
+        let (format, n) = formats[j];
+        assert!(
+            got[n..].iter().all(|&x| x == 0),
+            "{backend}: format {format} of {inputs:#010x?}: {got:#010x?}, want 0 past channel {n}"
+        );
+        if format >= 72 {
+            assert_eq!(got[..3], inputs[..3], "{backend}: format {format}");
+        }
+    });
+}
+
+/// A norm channel as RDNA2 converts it, correctly rounded: `k / (2^n - 1)`,
+/// or for snorm `s / (2^(n-1) - 1)` with the most negative `s` reading -1.
+/// The f64 quotient is correctly rounded, and rounding it again to f32
+/// can't go wrong here: that needs 28 equal bits after the f32's rounding
+/// bit, and the quotient's bits repeat every `n` (at most 16) bits.
+fn norm_channel(field: u32, n: u32, snorm: bool) -> u32 {
+    let (k, d) = if snorm {
+        let s = ((field << (32 - n)) as i32) >> (32 - n);
+        let d = (1 << (n - 1)) - 1;
+        (s.max(-d), d)
+    } else {
+        (field as i32, (1 << n) - 1)
+    };
+    ((f64::from(k) / f64::from(d)) as f32).to_bits()
+}
+
+#[test]
+fn tbuffer_load_norm_formats_round_correctly() {
+    // `(format, channel widths from the lowest bits, snorm)`: 8_UNORM,
+    // 16_UNORM, 16_SNORM, 8_8_8_8_UNORM, _SNORM, 16_16_UNORM, _SNORM,
+    // 10_11_11_UNORM, _SNORM, 11_11_10_UNORM, _SNORM, 10_10_10_2_UNORM,
+    // _SNORM, 2_10_10_10_UNORM, _SNORM. A division by `2^n - 1` on the host
+    // is 1 ULP off on some of these (`8_UNORM` 254: 0x3f7eff00, not
+    // 0x3f7efeff), on AMD and NVIDIA.
+    let formats: &[(u8, &[u32], bool)] = &[
+        (1, &[8], false),
+        (7, &[16], false),
+        (8, &[16], true),
+        (56, &[8, 8, 8, 8], false),
+        (57, &[8, 8, 8, 8], true),
+        (23, &[16, 16], false),
+        (24, &[16, 16], true),
+        (30, &[11, 11, 10], false),
+        (31, &[11, 11, 10], true),
+        (37, &[10, 11, 11], false),
+        (38, &[10, 11, 11], true),
+        (44, &[2, 10, 10, 10], false),
+        (45, &[2, 10, 10, 10], true),
+        (50, &[10, 10, 10, 2], false),
+        (51, &[10, 10, 10, 2], true),
+    ];
+    let list: Vec<u8> = formats.iter().map(|f| f.0).collect();
+    // Every byte in each position, then values the host's division got
+    // wrong for the wider fields.
+    let mut rows: Vec<[u32; 4]> = (0..64u32)
+        .map(|j| {
+            [
+                u32::from_le_bytes([
+                    4 * j as u8,
+                    4 * j as u8 + 1,
+                    4 * j as u8 + 2,
+                    4 * j as u8 + 3,
+                ]),
+                0,
+                0,
+                0,
+            ]
+        })
+        .collect();
+    for x in [
+        0x00FE_0181,
+        0x017F_7FFF,
+        0x1394_F736,
+        0x704B_8500,
+        0x721E_CCA3,
+        0x7905_77FD,
+        0x8571_1562,
+        0x86DC_1522,
+        0x983F_7D1B,
+        0x9906_2011,
+        0xAE3E_8374,
+        0xC071_D701,
+        0xCE05_CB84,
+        0xDE0A_FD93,
+        0xE4C4_5522,
+        0xF13F_1ABD,
+        0xF8AE_B55C,
+    ] {
+        rows.push([x, 0, 0, 0]);
+    }
+    run_typed_loads(&list, &rows, |backend, _, inputs, j, got| {
+        let (format, widths, snorm) = formats[j];
+        let mut at = 0;
+        let mut want = [0u32; 4];
+        for (ch, &w) in widths.iter().enumerate() {
+            let field = (inputs[0] >> at) & ((1u32 << w) - 1);
+            want[ch] = norm_channel(field, w, snorm);
+            at += w;
+        }
+        assert_eq!(
+            got, want,
+            "{backend}: format {format} of {:#010x}: {got:#010x?}, want {want:#010x?}",
+            inputs[0]
+        );
+    });
+}

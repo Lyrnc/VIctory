@@ -3124,13 +3124,12 @@ impl<'a> Lower<'a> {
 
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
-    // shortcut: the descriptor's channel swizzle is taken as the identity
-    // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    /// typed loads (`tbuffer_load_format_*`) do. Channels past the format's
+    /// read 0, the 4th too, and the descriptor's channel swizzle doesn't
+    /// apply: on RDNA2 (gfx1036) a `32_32_32_FLOAT` load reads
+    /// `(x, y, z, 0)` with `dst_sel_w` set to W, ONE, ZERO or X, where
+    /// `buffer_load_format_*` (the descriptor's format) does apply it.
+    // shortcut: elements of 4 bytes or more are taken as dword-aligned.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -3189,20 +3188,23 @@ impl<'a> Lower<'a> {
             };
             let f32t = self.s.t.f32;
             let x = match numeric {
-                Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    float(self, q)
-                }
+                Numeric::Unorm => self.norm_bits(field, w),
                 Numeric::Snorm => {
+                    // |s| / (2^(w-1) - 1) with the sign put back; the most
+                    // negative value reads -1, as -(2^(w-1) - 1) does.
                     let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    let lo = self.s.m.f32((-1.0f32).to_bits());
-                    let q = self.binary(35, q, lo);
-                    float(self, q)
+                    let zero = self.s.m.i32(0);
+                    let neg = self.s.m.cmp(c, pred::SLT, s, zero);
+                    let minus = self.s.m.bin(c, Bin::Sub, zero, s);
+                    let a = self.s.m.select(c, neg, minus, s);
+                    let (lowest, max) =
+                        (self.s.m.i32(1 << (w - 1)), self.s.m.i32((1 << (w - 1)) - 1));
+                    let at_lowest = self.s.m.cmp(c, pred::EQ, a, lowest);
+                    let a = self.s.m.select(c, at_lowest, max, a);
+                    let q = self.norm_bits(a, w - 1);
+                    let sign = self.s.m.i32(0x8000_0000);
+                    let signed_q = self.s.m.bin(c, Bin::Or, q, sign);
+                    self.s.m.select(c, neg, signed_q, q)
                 }
                 Numeric::Uscaled => {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
@@ -3232,15 +3234,59 @@ impl<'a> Lower<'a> {
             };
             out.push(x);
         }
-        let one = match numeric {
-            Numeric::Uint | Numeric::Sint => 1,
-            _ => 1.0f32.to_bits(),
-        };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
+        for _ in out.len() as u32..channels {
+            out.push(self.s.m.i32(0));
         }
         out.truncate(channels as usize);
         Ok(out)
+    }
+
+    /// The bits of `k / (2^n - 1)` correctly rounded to f32, for an i32 `k`
+    /// in `0..2^n` and `n` up to 16: a norm format's conversion, which the
+    /// hardware rounds correctly where a division by the constant on the
+    /// host is 1 ULP off for some values (`8_UNORM` 254 on AMD and NVIDIA).
+    /// In binary `k / (2^n - 1)` is the `n` bits of `k` repeating, so the
+    /// f32 is the 24 bits of that stream from its leading 1, plus 1 when the
+    /// 25th is set (never a tie: the stream doesn't end).
+    fn norm_bits(&mut self, k: V, n: u32) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        // The stream: as many copies of `k` as fit in 64 bits, the first at
+        // the top.
+        let copies = 64 / n;
+        let repeat = (0..copies).fold(0u64, |r, j| r | 1 << (j * n)) << (64 - copies * n);
+        let wide = self.s.m.cast(c, Cast::ZExt, k, i64t);
+        let r = self.s.m.int_const(i64t, repeat as i64);
+        let stream = self.s.m.bin(c, Bin::Mul, wide, r);
+        // `k` as an f32 is exact (`k < 2^24`); its exponent field `e` is
+        // 126 + the bit length of `k`, which puts the result's at `e - n`.
+        let kf = self.s.m.cast(c, Cast::UiToFp, k, self.s.t.f32);
+        let kb = self.as_int(kf);
+        let k23 = self.s.m.i32(23);
+        let e = self.s.m.bin(c, Bin::LShr, kb, k23);
+        // The leading 1 to bit 63, then its 25 bits from the top.
+        let lead = self.s.m.i32(n + 126);
+        let sh = self.s.m.bin(c, Bin::Sub, lead, e);
+        let m63 = self.s.m.i32(63);
+        let sh = self.s.m.bin(c, Bin::And, sh, m63);
+        let sh = self.s.m.cast(c, Cast::ZExt, sh, i64t);
+        let top = self.s.m.bin(c, Bin::Shl, stream, sh);
+        let k39 = self.s.m.int_const(i64t, 39);
+        let t = self.s.m.bin(c, Bin::LShr, top, k39);
+        let t = self.s.m.cast(c, Cast::Trunc, t, self.s.t.i32);
+        // Rounded to 24 bits; their leading 1 (or the carry out of them) adds
+        // 1 to the exponent field below it.
+        let one = self.s.m.i32(1);
+        let t = self.s.m.bin(c, Bin::Add, t, one);
+        let sig = self.s.m.bin(c, Bin::LShr, t, one);
+        let below = self.s.m.i32(n + 1);
+        let ex = self.s.m.bin(c, Bin::Sub, e, below);
+        let ex = self.s.m.bin(c, Bin::Shl, ex, k23);
+        let bits = self.s.m.bin(c, Bin::Add, ex, sig);
+        let zero = self.s.m.i32(0);
+        let is0 = self.s.m.cmp(c, pred::EQ, k, zero);
+        self.s.m.select(c, is0, zero, bits)
     }
 
     /// The byte offset a buffer descriptor built around a root descriptor adds
