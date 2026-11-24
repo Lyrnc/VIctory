@@ -2509,17 +2509,33 @@ impl<'a> Lower<'a> {
                 };
                 let r = self.s.m.bin(c, Bin::Add, a, b);
                 let carry = if name == "s_add_u32" {
-                    Some(self.s.m.cmp(c, pred::IULT, r, a))
+                    self.s.m.cmp(c, pred::IULT, r, a)
                 } else {
-                    None
+                    // The signed forms set SCC on signed overflow: both
+                    // operands differ in sign from the sum.
+                    let x = self.s.m.bin(c, Bin::Xor, a, r);
+                    let y = self.s.m.bin(c, Bin::Xor, b, r);
+                    let both = self.s.m.bin(c, Bin::And, x, y);
+                    let z = self.s.m.i32(0);
+                    self.s.m.cmp(c, pred::SLT, both, z)
                 };
-                (r, carry)
+                (r, Some(carry))
             }
             "s_sub_u32" | "s_sub_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let r = self.s.m.bin(c, Bin::Sub, a, b);
-                let carry = (name == "s_sub_u32").then(|| self.s.m.cmp(c, pred::IULT, a, b));
-                (r, carry)
+                let carry = if name == "s_sub_u32" {
+                    self.s.m.cmp(c, pred::IULT, a, b)
+                } else {
+                    // Signed overflow: the operands differ in sign and the
+                    // difference's sign is not the minuend's.
+                    let x = self.s.m.bin(c, Bin::Xor, a, b);
+                    let y = self.s.m.bin(c, Bin::Xor, a, r);
+                    let both = self.s.m.bin(c, Bin::And, x, y);
+                    let z = self.s.m.i32(0);
+                    self.s.m.cmp(c, pred::SLT, both, z)
+                };
+                (r, Some(carry))
             }
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);

@@ -320,6 +320,67 @@ fn v_med3_f16_matches_rdna2_with_nan() {
     });
 }
 
+/// The signed scalar adds and subtracts set SCC on signed overflow
+/// (`s_add_i32`, `s_sub_i32`, `s_addk_i32`); the same on gfx1036 hardware.
+#[test]
+fn s_add_and_sub_i32_set_scc_on_signed_overflow() {
+    // s_add_i32 / s_sub_i32 s20, s0, s1 (SOP2 0x02 / 0x03), or s_mov_b32 s20, s0
+    // then s_addk_i32 s20, 0x8123 (SOPK 0x0f, the constant sign-extends to
+    // -32477); then s_cselect_b32 s21, 1, 0 and v_mov_b32 v0, s21.
+    const fn sopk(op: u32, sdst: u32, k: u16) -> u32 {
+        0xB000_0000 | op << 23 | sdst << 16 | k as u32
+    }
+    let (max, min, neg1) = (0x7FFF_FFFFu32, 0x8000_0000u32, u32::MAX);
+    let add: &[([u32; 4], u32)] = &[
+        ([max, 1, 0, 0], 1),
+        ([min, neg1, 0, 0], 1),
+        ([1, 1, 0, 0], 0),
+        ([neg1, neg1, 0, 0], 0),
+        ([max, min, 0, 0], 0),
+        ([min, min, 0, 0], 1),
+        ([max, max, 0, 0], 1),
+        ([0x4000_0000, 0x4000_0000, 0, 0], 1),
+    ];
+    let sub: &[([u32; 4], u32)] = &[
+        ([min, 1, 0, 0], 1),
+        ([max, neg1, 0, 0], 1),
+        ([0, min, 0, 0], 1),
+        ([5, 3, 0, 0], 0),
+        ([neg1, max, 0, 0], 0),
+        ([min, min, 0, 0], 0),
+        ([0x4000_0000, 0xC000_0000, 0, 0], 1),
+    ];
+    let addk: &[([u32; 4], u32)] = &[
+        ([min, 0, 0, 0], 1),
+        ([0, 0, 0, 0], 0),
+        ([max, 0, 0, 0], 0),
+        ([0x8000_7000, 0, 0, 0], 1),
+        ([0x8000_9000, 0, 0, 0], 0),
+    ];
+    let tail = [sop2(0x0A, 21, 0x81, 0x80), vop1(0x001, 0, sgpr(21))];
+    for (what, head, cases) in [
+        ("s_add_i32", vec![sop2(0x02, 20, 0, 1)], add),
+        ("s_sub_i32", vec![sop2(0x03, 20, 0, 1)], sub),
+        (
+            "s_addk_i32",
+            vec![s_mov_b32(20, 0), sopk(0x0F, 20, 0x8123)],
+            addk,
+        ),
+    ] {
+        let body: Vec<u32> = head.iter().chain(&tail).copied().collect();
+        let shader = build_valu_cs(&body);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: SCC of {what}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+}
+
 #[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
