@@ -1946,6 +1946,55 @@ mod tests {
         assert!(heap.is_ok(), "no heap of the limit ({limit}): {heap:?}");
     }
 
+    /// On a host that caps its view heaps, a heap for the title's 1,245,184
+    /// slots is made at the cap: the title's slots, the whole dynamic range,
+    /// the copy pairs' room, then the null buffer views and the clamp's slot
+    /// at the top. The null views are made there, every pair of the room
+    /// and the whole dynamic range can be taken, and none reaches the null
+    /// views. Skipped where view heaps are not capped.
+    #[test]
+    fn a_capped_view_heap_keeps_the_dynamic_range_pairs_and_null_views() {
+        let Some(heap) = HostHeap::new(false, 1_245_184) else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let views = victory_shader::emit::view_heap_limit();
+        if views == victory_shader::emit::HEAP_VIEWS {
+            eprintln!("view heaps not capped here; skipped");
+            return;
+        }
+        let null = victory_shader::emit::null_buffer_view();
+        // SAFETY: a plain query of a live heap.
+        assert_eq!(unsafe { heap.heap.GetDesc() }.NumDescriptors, views, "a heap of the cap");
+        assert_eq!(null, views - 2);
+        assert_eq!(heap.count(), views - DYNAMIC - CAPPED_PAIRS - 3, "the title's slots");
+        assert_eq!(heap.dynamic, DYNAMIC, "the whole dynamic range");
+        assert_eq!(heap.pairs_end, null - 1, "the pairs end at the null UAV");
+        // The null SRV and UAV are raw views: stride 4 in the table.
+        let (_, strides) = heap.strides.as_ref().expect("a view-stride table");
+        // SAFETY: dwords of the mapped table, which has one per index below the limit.
+        let stride = |i: u32| unsafe { (*strides as *const u32).add(i as usize).read_volatile() };
+        assert_eq!((stride(null), stride(null - 1)), (4, 4), "the null buffer views");
+        // Every pair of the room past the dynamic range, then dynamic slots.
+        let room = heap.count() + heap.dynamic;
+        let pairs: Vec<u32> = (0..CAPPED_PAIRS / 2).map(|_| heap.pair().unwrap()).collect();
+        assert_eq!((pairs[0], pairs[pairs.len() - 1]), (room, null - 3));
+        let spilled = heap.pair().expect("a pair in dynamic slots");
+        assert_eq!(spilled, heap.count(), "past the room: the first dynamic slots");
+        heap.free_pair(spilled);
+        // The whole dynamic range is one run; then nothing is left.
+        assert_eq!(heap.dynamic(heap.dynamic), Some(heap.count()));
+        assert_eq!(heap.pair(), None, "the null views are not handed out");
+        heap.free_pair(pairs[0]);
+        assert_eq!(heap.pair(), Some(room), "a pair given back is taken again");
+        eprintln!(
+            "view heap cap {views}: {} title slots, {} dynamic, {CAPPED_PAIRS} pair slots, null UAV at {}",
+            heap.count(),
+            heap.dynamic,
+            null - 1
+        );
+    }
+
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
     #[test]
