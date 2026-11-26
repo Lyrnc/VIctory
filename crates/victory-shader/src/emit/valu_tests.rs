@@ -2281,3 +2281,78 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// VOP3 `op_sel` on a VOP1 or VOP2 16-bit opcode: RDNA2 ignores it, so the
+/// sources are the low halves and the result goes to the low half, the high
+/// half kept. VOP3-only opcodes apply it (`v_fma_f16`, `v_med3_f16`,
+/// `v_add_nc_u16` below). The expected values are gfx1036's; a NaN half
+/// matches any NaN.
+#[test]
+fn vop1_and_vop2_16_bit_opcodes_ignore_vop3_op_sel() {
+    // v_mov_b32 v0, v4; <op>_e64 v0, v1[, v2[, v3]] op_sel (bit 3: the result)
+    let rows: [[u32; 4]; 4] = [
+        [0x4000_3C00, 0x4400_3800, 0xC000_3400, 0xABCD_1234],
+        [0x3800_C200, 0x3C00_4100, 0x4200_B800, 0x5555_AAAA],
+        [0x7E00_4248, 0xBC00_5640, 0x0001_8000, 0x0000_0000],
+        [0x5BFF_0400, 0x3555_3C01, 0x7C00_FC00, 0xFFFF_FFFF],
+    ];
+    // (opcode, its VOP3 opcode, sources, op_sel)
+    let cases: [(&str, u16, usize, u32); 17] = [
+        ("v_add_f16", 0x132, 2, 0b1011),
+        ("v_mul_f16", 0x135, 2, 0b0010),
+        ("v_max_f16", 0x139, 2, 0b0001),
+        ("v_sub_f16", 0x133, 2, 0b1000),
+        ("v_fmac_f16", 0x136, 2, 0b1011),
+        ("v_cvt_f32_f16", 0x18B, 1, 0b0001),
+        ("v_cvt_f16_f32", 0x18A, 1, 0b1000),
+        ("v_sqrt_f16", 0x1D5, 1, 0b1001),
+        ("v_rcp_f16", 0x1D4, 1, 0b0001),
+        ("v_floor_f16", 0x1DB, 1, 0b1000),
+        ("v_cvt_u16_f16", 0x1D2, 1, 0b0001),
+        ("v_cvt_i16_f16", 0x1D3, 1, 0b1000),
+        ("v_cvt_f16_u16", 0x1D0, 1, 0b1001),
+        ("v_cvt_norm_i16_f16", 0x1E3, 1, 0b0001),
+        // VOP3-only: op_sel applies.
+        ("v_fma_f16", 0x34B, 3, 0b1111),
+        ("v_med3_f16", 0x357, 3, 0b1001),
+        ("v_add_nc_u16", 0x303, 2, 0b1011),
+    ];
+    // The result per case and row.
+    let want: [[u32; 4]; 17] = [
+        [0xABCD_3E00, 0x5555_B800, 0x0000_5672, 0xFFFF_3C01],
+        [0xABCD_3800, 0x5555_C780, 0x0000_5CE8, 0xFFFF_0401],
+        [0xABCD_3C00, 0x5555_4100, 0x0000_5640, 0xFFFF_3C01],
+        [0xABCD_3800, 0x5555_C580, 0x0000_D60E, 0xFFFF_BC01],
+        [0xABCD_3802, 0x5555_C78D, 0x0000_5CE8, 0xFFFF_FFFF],
+        [0x3F80_0000, 0xC040_0000, 0x4049_0000, 0x3880_0000],
+        [0xABCD_4002, 0x5555_0203, 0x0000_7C00, 0xFFFF_7C00],
+        [0xABCD_3C00, 0x5555_FE00, 0x0000_3F17, 0xFFFF_2000],
+        [0xABCD_3C00, 0x5555_B555, 0x0000_3518, 0xFFFF_7400],
+        [0xABCD_3C00, 0x5555_C200, 0x0000_4200, 0xFFFF_0000],
+        [0xABCD_0001, 0x5555_0000, 0x0000_0003, 0xFFFF_0000],
+        [0xABCD_0001, 0x5555_FFFD, 0x0000_0003, 0xFFFF_0000],
+        [0xABCD_7380, 0x5555_7A10, 0x0000_7424, 0xFFFF_6400],
+        [0xABCD_7FFF, 0x5555_8001, 0x0000_7FFF, 0xFFFF_0002],
+        [0x4600_1234, 0x4300_AAAA, 0x7E00_0000, 0x7C00_FFFF],
+        [0x3800_1234, 0x3800_AAAA, 0x8000_0000, 0x3C01_FFFF],
+        [0x8400_1234, 0x7400_AAAA, 0x3A00_0000, 0x9154_FFFF],
+    ];
+    // Equal but for NaNs in the half at bit `sh`.
+    let nan_half = |a: u32, b: u32, sh: u32| {
+        let other = !(0xFFFF << sh);
+        (a ^ b) & other == 0 && is_f16_nan((a >> sh) as u16) && is_f16_nan((b >> sh) as u16)
+    };
+    for (&(what, op, n, opsel), want) in cases.iter().zip(want) {
+        let src = |k: usize| if k < n { vgpr(1 + k as u8) } else { 0x80 };
+        let w = vop3(op, 0, src(0), src(1), src(2));
+        let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), w[0] | opsel << 11, w[1]]);
+        run_cases(&shader, &rows, |backend, i, inp, got| {
+            let ok = got == want[i] || nan_half(got, want[i], 0) || nan_half(got, want[i], 16);
+            assert!(
+                ok,
+                "{backend}: {what} op_sel {opsel:#06b} on {inp:08x?} = {got:#010x}, want {:#010x}",
+                want[i],
+            );
+        });
+    }
+}

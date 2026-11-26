@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Encoding, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -6799,6 +6799,20 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
+    /// The VOP3 `op_sel` bits as RDNA2 applies them (bit 3: the
+    /// destination). A VOP1 or VOP2 opcode in its VOP3 form ignores them:
+    /// its sources and its result are the low halves whatever op_sel says
+    /// (measured on gfx1036 for every 16-bit VOP1 and VOP2 operation the
+    /// lowering takes). VOP3-only opcodes apply them.
+    fn vop3_opsel(inst: &Inst) -> u8 {
+        let Fields::Valu(v) = &inst.fields else {
+            return 0;
+        };
+        let vop1_or_vop2 = inst.machine.encoding == Encoding::Vop3
+            && matches!(inst.machine.opcode, 0x100..0x140 | 0x180..0x200);
+        if vop1_or_vop2 { 0 } else { v.opsel }
+    }
+
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
     /// op_sel (or an SDWA word select) picks the high half; inline float
     /// constants are f16 values here.
@@ -6807,7 +6821,7 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let mut high = v.opsel >> k & 1 != 0;
+        let mut high = Self::vop3_opsel(inst) >> k & 1 != 0;
         if let Some(sd) = v.sdwa {
             match sd.src_sel.get(k).copied().unwrap_or(6) {
                 4 => {}
@@ -6864,7 +6878,7 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a 16-bit result outside a VGPR");
         };
-        let mut high = v.opsel >> 3 & 1 != 0;
+        let mut high = Self::vop3_opsel(inst) >> 3 & 1 != 0;
         // SDWA: the word written, the other one kept (preserve) or zero
         // (pad; a sign extension above the high word adds nothing).
         let mut keep = true;
@@ -7014,7 +7028,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
+                let x = if Self::vop3_opsel(inst) >> 3 & 1 != 0 {
                     let k16 = self.s.m.i32(16);
                     self.s.m.bin(c, Bin::LShr, x, k16)
                 } else {
