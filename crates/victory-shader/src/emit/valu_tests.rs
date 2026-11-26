@@ -2284,7 +2284,7 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
 
 /// `v_mov_b32` source modifiers (`abs`/`neg`) are bitwise sign-bit operations
 /// on 32-bit patterns (preserving denormals, `-0.0`, and NaN payloads/signaling
-/// bits), unless float output modifiers (`clamp`/`omod`) are active.
+/// bits), with or without `clamp`/`omod`, which RDNA2 ignores on a move.
 #[test]
 fn v_mov_b32_modifiers_are_bitwise() {
     let vmov_e64 = |abs: u8, neg: u8, clamp: bool, omod: u8| -> [u32; 2] {
@@ -2357,12 +2357,12 @@ fn v_mov_b32_modifiers_are_bitwise() {
         });
     }
 
-    // Float output modifiers (`clamp` + `omod = mul:2`) take the negated bits as f32.
+    // `clamp` + `omod = mul:2` change nothing but the negation (gfx1036).
     let float_shader = build_valu_cs(&vmov_e64(0, 1, true, 1));
     let float_cases: &[(u32, u32)] = &[
-        ((-0.25f32).to_bits(), 0.5f32.to_bits()),
-        ((-0.75f32).to_bits(), 1.0f32.to_bits()),
-        ((0.25f32).to_bits(), 0.0f32.to_bits()),
+        ((-0.25f32).to_bits(), 0.25f32.to_bits()),
+        ((-0.75f32).to_bits(), 0.75f32.to_bits()),
+        ((0.25f32).to_bits(), (-0.25f32).to_bits()),
     ];
     let float_inputs: Vec<[u32; 4]> = float_cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
     run_cases(&float_shader, &float_inputs, |backend, i, inp, got| {
@@ -2373,4 +2373,54 @@ fn v_mov_b32_modifiers_are_bitwise() {
             inp[0]
         );
     });
+}
+
+/// RDNA2 ignores `clamp` and the output modifier on `v_mov_b32`: the bits
+/// move, negated or not (`neg` still flips bit 31). Every row is a gfx1036
+/// result, the same with IEEE mode on and off and with f32 denormals flushed
+/// and kept. A float `clamp` would give 0 for -1.0 and 1.0 for 2.0, `mul:2`
+/// 2.0 for 1.0, and a flush or NaN quieting would change the last four.
+#[test]
+fn v_mov_b32_ignores_clamp_and_output_modifiers() {
+    // v_mov_b32_e64 v0, v1: clamp is bit 15 of the first dword; omod
+    // (1 mul:2, 2 mul:4, 3 div:2) bits 27-28 and neg bit 29 of the second.
+    let mov = |neg: bool, clamp: bool, omod: u32| -> [u32; 2] {
+        [
+            0x35 << 26 | 0x181 << 16 | u32::from(clamp) << 15,
+            u32::from(neg) << 29 | omod << 27 | u32::from(vgpr(1)),
+        ]
+    };
+    let inputs: Vec<[u32; 4]> = [
+        0xBF80_0000, // -1.0
+        0x3F80_0000, // 1.0
+        0x4000_0000, // 2.0
+        0x3E80_0000, // 0.25
+        0x7F7F_FFFF, // the largest float
+        0x8000_0000, // -0.0
+        0x0000_0001, // the smallest denormal
+        0x7F80_0001, // a signalling NaN
+        0xFFC0_1234, // a quiet NaN with a payload
+    ]
+    .iter()
+    .map(|&x| [x, 0, 0, 0])
+    .collect();
+    for (neg, clamp, omod, label) in [
+        (false, true, 0, "clamp"),
+        (false, false, 1, "mul:2"),
+        (false, false, 2, "mul:4"),
+        (false, false, 3, "div:2"),
+        (false, true, 3, "div:2 clamp"),
+        (true, true, 0, "-v1 clamp"),
+        (true, false, 1, "-v1 mul:2"),
+    ] {
+        let shader = build_valu_cs(&mov(neg, clamp, omod));
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let want = if neg { inp[0] ^ 0x8000_0000 } else { inp[0] };
+            assert_eq!(
+                got, want,
+                "{backend}: v_mov_b32 v0, v1 {label} ({:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0]
+            );
+        });
+    }
 }

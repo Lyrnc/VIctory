@@ -6247,12 +6247,15 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
+                // The bits move: RDNA2 ignores `clamp` and the output
+                // modifier here (measured on gfx1036, IEEE mode on and off,
+                // f32 denormals flushed and kept).
                 let a = self.src_bits(inst, 0)?;
-                if v.clamp || v.omod != 0 {
-                    let a = self.as_float(a);
-                    return float(self, a);
-                }
-                int(self, a)
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a move outside a VGPR");
+                };
+                self.write(inst, Reg::V(reg), a, guard);
+                Ok(())
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
